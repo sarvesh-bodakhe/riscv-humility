@@ -4110,9 +4110,16 @@ impl HubrisObjectLoader {
         self.load_object_dwarf(task, buffer, &elf)
             .with_context(|| format!("{}: failed to load DWARF", object))?;
 
-        self.load_object_frames(task, buffer, &elf).with_context(|| {
-            format!("{}: failed to load debug frames", object)
-        })?;
+        //
+        // Debug frames only feed stack unwinding, and the RISC-V port's
+        // objects don't carry a .debug_frame section today -- so require
+        // them exactly where they will be consumed.
+        //
+        if arch.has_unwind() {
+            self.load_object_frames(task, buffer, &elf).with_context(|| {
+                format!("{}: failed to load debug frames", object)
+            })?;
+        }
 
         let iface = self.load_object_idolatry(object, buffer, &elf)?;
 

@@ -102,11 +102,58 @@ impl Arch for ArmM {
     }
 }
 
+/// The RV32 backend, for Hubris on RISC-V; the ESP32-C6 is its first
+/// target.
+///
+/// Register reconstruction, stack unwinding and instruction analysis are
+/// not implemented yet -- the corresponding capabilities report false and
+/// their consumers refuse cleanly. What is implemented is everything the
+/// memory-and-reflection commands need: `tasks` (plain), `readmem`,
+/// `map`, `manifest`.
+pub struct Riscv32;
+
+impl Arch for Riscv32 {
+    fn name(&self) -> &'static str {
+        "riscv32"
+    }
+
+    fn elf_machine(&self) -> u16 {
+        goblin::elf::header::EM_RISCV
+    }
+
+    // Function symbols carry no tag bits on RISC-V; the default identity
+    // `strip_fn_addr` stands.
+
+    fn pc_reg(&self) -> RegId {
+        //
+        // The debug module exposes the halted PC as the dpc CSR, 0x7b1,
+        // which is also how probe-rs names it.
+        //
+        RegId(0x7b1)
+    }
+
+    /// The RISC-V port's syscall args live in a0..a6 (doc/syscalls.adoc),
+    /// and SavedState's members carry the ABI names.
+    fn saved_arg_member(&self, n: usize) -> Option<&'static str> {
+        Some(match n {
+            0 => "a0",
+            1 => "a1",
+            2 => "a2",
+            3 => "a3",
+            4 => "a4",
+            5 => "a5",
+            6 => "a6",
+            _ => return None,
+        })
+    }
+}
+
 /// Returns the backend for an ELF `e_machine`, if the architecture is
 /// known.
 pub fn from_elf_machine(machine: u16) -> Option<&'static dyn Arch> {
     match machine {
         goblin::elf::header::EM_ARM => Some(&ArmM),
+        goblin::elf::header::EM_RISCV => Some(&Riscv32),
         _ => None,
     }
 }
