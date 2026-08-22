@@ -180,9 +180,11 @@ fn process_dump(
             DumpSegment::Register(reg) => {
                 //
                 // These are register values; slurp them and continue.
+                // The id is validated against ARMRegister because the
+                // dump agents are (today) an ARM-only mechanism.
                 //
                 if let Some(register) = ARMRegister::from_u16(reg.register) {
-                    out.add_register(register, reg.value);
+                    out.add_register(register.into(), reg.value);
                 } else {
                     let r = reg.register;
                     bail!("unrecognized register {r:#x} at offset {offset}");

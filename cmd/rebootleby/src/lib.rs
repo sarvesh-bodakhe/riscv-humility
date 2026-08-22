@@ -175,7 +175,7 @@ impl FlashHack<'_> {
         self.core.halt()?;
         // Branch to self instruction
         self.poke(0x1400_0000, 0xe7fee7fe)?;
-        self.core.write_reg(ARMRegister::PC, 0x1400_0000)?;
+        self.core.write_reg(ARMRegister::PC.into(), 0x1400_0000)?;
 
         // We have to clear the super sekrit bits to have this work on
         // the CFPA/CMPA region. No these are not documented!

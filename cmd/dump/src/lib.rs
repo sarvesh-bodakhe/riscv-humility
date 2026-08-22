@@ -229,7 +229,7 @@ fn emulate_dump(
 
             for i in start..=31 {
                 if let Some(reg) = ARMRegister::from_u16(i) {
-                    let val = shared.borrow_mut().read_reg(reg)?;
+                    let val = shared.borrow_mut().read_reg(reg.into())?;
                     rnum = i + 1;
                     return Ok(Some(humpty::RegisterRead(i, val)));
                 }
@@ -474,8 +474,8 @@ fn simulate_dump_via_agent(
             None => {
                 for i in 0..=ARMRegister::max() {
                     if let Some(reg) = ARMRegister::from_u16(i) {
-                        let val = core.read_reg(reg)?;
-                        out.add_register(reg, val);
+                        let val = core.read_reg(reg.into())?;
+                        out.add_register(reg.into(), val);
                     }
                 }
             }

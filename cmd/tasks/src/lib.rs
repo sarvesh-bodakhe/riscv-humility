@@ -223,7 +223,21 @@ pub fn print_tasks(
     let task_t = hubris.lookup_struct_byname("Task")?;
     let save = task_t.lookup_member("save")?.offset;
     let state = hubris.lookup_struct_byname("SavedState")?;
-    let r4 = save + state.lookup_member("r4")?.offset;
+
+    //
+    // Hubris keeps syscall arguments in registers whose spill into
+    // SavedState is the argument marshalling; which registers those are is
+    // the port's ABI choice (r4.. on ARM, a0.. on RISC-V), so we resolve
+    // each argument slot to its member by name via the arch backend.
+    //
+    let arch = hubris.arch();
+    let mut arg_offset = vec![];
+    for n in 0..=2 {
+        let member = arch
+            .saved_arg_member(n)
+            .ok_or_else(|| anyhow!("no syscall arg {n} on {}", arch.name()))?;
+        arg_offset.push(save + state.lookup_member(member)?.offset);
+    }
 
     let mut found = false;
 
@@ -288,14 +302,16 @@ pub fn print_tasks(
             let task: Task = Task::from_value(&task_value)?;
 
             //
-            // Always load R4, R5 and R6, which are in the saved state in our
-            // task structure (and are needed to print state).
+            // Always load syscall arguments 0..=2 from the saved state in
+            // our task structure (they are needed to print state: the
+            // notification mask for a task in recv, the message for a
+            // panicked one).
             //
-            for r in 4..=6 {
-                let o = offs + r4 + (r - 4) * 4;
+            for (n, o) in arg_offset.iter().enumerate() {
+                let o = offs + o;
                 let v =
                     u32::from_le_bytes(taskblock[o..o + 4].try_into().unwrap());
-                regs.insert((i, ARMRegister::from_usize(r).unwrap()), v);
+                regs.insert((i, n), v);
             }
 
             tasks.push((i, addr, task_value, task));
@@ -612,7 +628,7 @@ fn explain_state(
     hubris: &HubrisArchive,
     core: &mut dyn Core,
     task_index: u32,
-    regs: &HashMap<(u32, ARMRegister), u32>,
+    regs: &HashMap<(u32, usize), u32>,
     ts: TaskState,
     current: bool,
     irqs: Option<&Vec<(u32, u32)>>,
@@ -648,7 +664,7 @@ fn explain_sched_state(
     w: &mut dyn Write,
     hubris: &HubrisArchive,
     task_index: u32,
-    regs: &HashMap<(u32, ARMRegister), u32>,
+    regs: &HashMap<(u32, usize), u32>,
     current: bool,
     irqs: Option<&Vec<(u32, u32)>>,
     timer: Option<Deadline>,
@@ -680,7 +696,7 @@ fn explain_sched_state(
             print_task_id(w, hubris, tid)?;
         }
         SchedState::InRecv(tid) => {
-            let notmask = *regs.get(&(task_index, ARMRegister::R6)).unwrap();
+            let notmask = *regs.get(&(task_index, 2)).unwrap();
             explain_recv(w, hubris, task_index, tid, notmask, irqs, timer)?;
         }
     }
@@ -706,7 +722,7 @@ fn explain_fault_info(
     hubris: &HubrisArchive,
     core: &mut dyn Core,
     task_index: u32,
-    regs: &HashMap<(u32, ARMRegister), u32>,
+    regs: &HashMap<(u32, usize), u32>,
     fi: doppel::FaultInfo,
 ) -> Result<()> {
     use doppel::FaultInfo;
@@ -759,8 +775,8 @@ fn explain_fault_info(
             explain_usage_error(w, ue)?;
         }
         FaultInfo::Panic => {
-            let msg_base = *regs.get(&(task_index, ARMRegister::R4)).unwrap();
-            let msg_len = *regs.get(&(task_index, ARMRegister::R5)).unwrap();
+            let msg_base = *regs.get(&(task_index, 0)).unwrap();
+            let msg_len = *regs.get(&(task_index, 1)).unwrap();
             let msg_len = msg_len.min(255) as usize;
             let mut buf = vec![0; msg_len];
             core.read_bulk(msg_base, &mut buf)?;

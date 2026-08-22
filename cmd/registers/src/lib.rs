@@ -278,7 +278,7 @@ fn registers(
             continue;
         }
 
-        let val = match core.read_reg(reg) {
+        let val = match core.read_reg(reg.into()) {
             Ok(val) => val,
             Err(_) => {
                 continue;

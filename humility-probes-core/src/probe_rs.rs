@@ -3,11 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use anyhow::{Context, Result, bail};
+use humility::reg::RegId;
 use humility::{
     core::{Core, PreviousCpuState},
     log::{Logger, info, trace},
 };
-use humility_arch_arm::ARMRegister;
 use std::collections::{BTreeMap, HashMap};
 
 use probe_rs::MemoryInterface;
@@ -47,6 +47,17 @@ impl ProbeCore {
         can_flash: bool,
         log: &Logger,
     ) -> Self {
+        //
+        // The regions readable without halting are an ARM property
+        // (the PPB); on any other architecture there are none.
+        //
+        let unhalted_read = match session.architecture() {
+            probe_rs::Architecture::Arm => {
+                humility_arch_arm::unhalted_read_regions()
+            }
+            _ => Default::default(),
+        };
+
         Self {
             session,
             identifier,
@@ -54,7 +65,7 @@ impl ProbeCore {
             product_id,
             serial_number,
             halted: false,
-            unhalted_read: humility_arch_arm::unhalted_read_regions(),
+            unhalted_read,
             can_flash,
             log: log.clone(),
         }
@@ -320,13 +331,15 @@ impl Core for ProbeCore {
         self.read_with(ReadKind::Bytes, addr, data)
     }
 
-    fn read_reg(&mut self, reg: ARMRegister) -> Result<u32> {
+    fn read_reg(&mut self, reg: RegId) -> Result<u32> {
         let mut core = self.session.core(0)?;
-        use num_traits::ToPrimitive;
 
-        Ok(core.read_core_reg(Into::<probe_rs::RegisterId>::into(
-            ARMRegister::to_u16(&reg).unwrap(),
-        ))?)
+        //
+        // A RegId's value is by definition the debug-transport selector
+        // (DCRSR encoding on ARM, abstract-command number on RISC-V), so
+        // it maps straight onto probe-rs's RegisterId.
+        //
+        Ok(core.read_core_reg(Into::<probe_rs::RegisterId>::into(reg.0))?)
     }
 
     fn write_word_32(&mut self, addr: u32, data: u32) -> Result<()> {
@@ -519,16 +532,10 @@ impl ProbeCore {
         Ok(())
     }
 
-    pub fn write_reg(&mut self, reg: ARMRegister, value: u32) -> Result<()> {
+    pub fn write_reg(&mut self, reg: RegId, value: u32) -> Result<()> {
         let mut core = self.session.core(0)?;
-        use num_traits::ToPrimitive;
 
-        core.write_core_reg(
-            Into::<probe_rs::RegisterId>::into(
-                ARMRegister::to_u16(&reg).unwrap(),
-            ),
-            value,
-        )?;
+        core.write_core_reg(Into::<probe_rs::RegisterId>::into(reg.0), value)?;
 
         Ok(())
     }

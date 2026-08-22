@@ -2,14 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use crate::reg::RegId;
 use crate::{
     core::{Core, PreviousCpuState},
     hubris::{HubrisArchive, HubrisDataMap, OXIDE_NT_HUBRIS_REGISTERS},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use goblin::elf::Elf;
-use humility_arch_arm::ARMRegister;
-use num_traits::FromPrimitive;
 use std::{collections::HashMap, fs::File, io::Read};
 
 /// A core stored entirely in the memory of the computer running Humility
@@ -30,7 +29,7 @@ pub struct InMemoryCore {
     mem: Option<HubrisDataMap>,
 
     /// Register values (if present)
-    registers: Option<HashMap<ARMRegister, u32>>,
+    registers: Option<HashMap<RegId, u32>>,
 }
 
 impl Core for InMemoryCore {
@@ -74,7 +73,7 @@ impl Core for InMemoryCore {
         }
     }
 
-    fn read_reg(&mut self, reg: ARMRegister) -> Result<u32> {
+    fn read_reg(&mut self, reg: RegId) -> Result<u32> {
         match &self.registers {
             Some(regs) => {
                 if let Some(val) = regs.get(&reg) {
@@ -165,7 +164,7 @@ impl InMemoryCore {
         self.mem.as_mut().unwrap().insert(addr, contents)
     }
 
-    pub fn add_register(&mut self, reg: ARMRegister, val: u32) {
+    pub fn add_register(&mut self, reg: RegId, val: u32) {
         if self.registers.is_none() {
             self.registers = Some(HashMap::new());
         }
@@ -177,7 +176,7 @@ impl InMemoryCore {
     }
 }
 
-fn load_registers(r: &[u8]) -> Result<HashMap<ARMRegister, u32>> {
+fn load_registers(r: &[u8]) -> Result<HashMap<RegId, u32>> {
     if !r.len().is_multiple_of(8) {
         bail!("bad length {} in registers note", r.len());
     }
@@ -190,15 +189,15 @@ fn load_registers(r: &[u8]) -> Result<HashMap<ARMRegister, u32>> {
         let id = u32::from_le_bytes(id.try_into().unwrap());
         let val = u32::from_le_bytes(val.try_into().unwrap());
 
-        let reg = match ARMRegister::from_u32(id) {
-            Some(r) => r,
-            None => {
-                // This can totally happen if we encounter a future coredump
-                // where we decided to store, say, additional MSRs or a
-                // floating point register. Since this version of Humility
-                // doesn't understand them, we'll just skip it.
-                continue;
-            }
+        //
+        // Register ids in the note are the debug-transport selectors (see
+        // RegId); anything that does not fit is from a future coredump
+        // format this version of Humility does not understand, and is
+        // skipped rather than rejected.
+        //
+        let reg = match u16::try_from(id) {
+            Ok(r) => RegId(r),
+            Err(_) => continue,
         };
 
         if registers.insert(reg, val).is_some() {

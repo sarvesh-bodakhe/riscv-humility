@@ -258,13 +258,13 @@ fn probecmd(subargs: ProbeArgs, context: &mut ExecutionContext) -> Result<()> {
             //
             let rval = core
                 .halt()
-                .and_then(|_| core.read_reg(ARMRegister::PC))
+                .and_then(|_| core.read_reg(ARMRegister::PC.into()))
                 .and_then(|val| {
                     core.step()?;
                     Ok(val)
                 })
                 .and_then(|val| {
-                    if core.read_reg(ARMRegister::PC)? == val {
+                    if core.read_reg(ARMRegister::PC.into())? == val {
                         Ok("not progressing")
                     } else {
                         Ok("progressing")
@@ -347,7 +347,7 @@ fn probecmd(subargs: ProbeArgs, context: &mut ExecutionContext) -> Result<()> {
             }
         };
 
-        let val = core.read_reg(reg)?;
+        let val = core.read_reg(reg.into())?;
 
         info!(
             log,

@@ -1156,6 +1156,9 @@ pub struct HubrisArchive {
     // Manual stack pushes before a syscall
     syscall_pushes: HashMap<u32, Option<Vec<ARMRegister>>>,
 
+    // Architecture backend, selected by the loaded objects' ELF machine
+    arch: Option<&'static dyn crate::arch::Arch>,
+
     // Modules: text address to module
     modules: BTreeMap<u32, HubrisModule>,
 
@@ -1237,6 +1240,13 @@ pub struct HubrisArchive {
 
 #[rustfmt::skip::macros(anyhow, bail)]
 impl HubrisArchive {
+    /// The architecture backend for this archive's objects. An archive
+    /// with no objects loaded defaults to ARM, Humility's historical
+    /// assumption (this covers dumps predating the architecture split).
+    pub fn arch(&self) -> &'static dyn crate::arch::Arch {
+        self.arch.unwrap_or(&crate::arch::ArmM)
+    }
+
     pub fn instr_len(&self, addr: u32) -> Option<u32> {
         self.instrs.get(&addr).map(|instr| instr.0.len() as u32)
     }
@@ -1541,6 +1551,7 @@ impl HubrisArchive {
             ntasks,
             instrs: loader.instrs,
             syscall_pushes: loader.syscall_pushes,
+            arch: loader.arch,
             modules: loader.modules,
             tasks: loader.tasks,
             frames: loader.frames,
@@ -2148,7 +2159,7 @@ impl HubrisArchive {
                 PreviousCpuState::Running => true,
             };
 
-            if let Ok(pc) = core.read_reg(ARMRegister::PC) {
+            if let Ok(pc) = core.read_reg(self.arch().pc_reg()) {
                 if should_run {
                     core.run()?;
                 }
@@ -2195,7 +2206,7 @@ impl HubrisArchive {
         &self,
         core: &mut dyn crate::core::Core,
     ) -> Result<PcResult> {
-        let pc = core.read_reg(ARMRegister::PC)?;
+        let pc = core.read_reg(self.arch().pc_reg())?;
         if self.instr_mod(pc).is_none() {
             Ok(PcResult::NotInArchive { pc })
         } else {
@@ -2652,6 +2663,13 @@ impl HubrisArchive {
         core: &mut dyn crate::core::Core,
         t: HubrisTask,
     ) -> Result<BTreeMap<ARMRegister, u32>> {
+        if !self.arch().has_unwind() {
+            bail!(
+                "register reconstruction is not yet implemented for {}",
+                self.arch().name()
+            );
+        }
+
         let (base, _) = self.task_table(core)?;
         let cur = self.current_task(core)?;
 
@@ -2679,7 +2697,7 @@ impl HubrisArchive {
         // If this is the current task, we want to pull the current PC.
         //
         if cur == Some(t) {
-            let pc = core.read_reg(ARMRegister::PC)?;
+            let pc = core.read_reg(ARMRegister::PC.into())?;
 
             //
             // If the PC falls within the task, then we are at user-level,
@@ -2702,7 +2720,7 @@ impl HubrisArchive {
                         }
                     };
 
-                    let val = core.read_reg(reg)?;
+                    let val = core.read_reg(reg.into())?;
                     rval.insert(reg, val);
                 }
 
@@ -3214,6 +3232,15 @@ impl HubrisArchive {
         use indicatif::{HumanBytes, HumanDuration};
         use indicatif::{ProgressBar, ProgressStyle};
 
+        //
+        // The dump format tags its architecture only via e_machine, and
+        // both the register slurp below and readers of the result assume
+        // ARM; this is revisited when dumps come to the RISC-V port.
+        //
+        if self.arch().elf_machine() != goblin::elf::header::EM_ARM {
+            bail!("dumps are not yet implemented for {}", self.arch().name());
+        }
+
         let segments = self.dump_segments(core, task, true)?;
         let nsegs = segments.len();
 
@@ -3255,7 +3282,7 @@ impl HubrisArchive {
             None => {
                 for i in 0..31 {
                     if let Some(reg) = ARMRegister::from_u16(i) {
-                        let val = core.read_reg(reg)?;
+                        let val = core.read_reg(reg.into())?;
                         regs.push((i, val));
                     }
                 }
@@ -3689,6 +3716,9 @@ struct HubrisObjectLoader {
     // Manual stack pushes before a syscall
     syscall_pushes: HashMap<u32, Option<Vec<ARMRegister>>>,
 
+    // Architecture backend, selected by the loaded objects' ELF machine
+    arch: Option<&'static dyn crate::arch::Arch>,
+
     // Unions: goff to union
     unions: HashMap<HubrisGoff, HubrisUnion>,
 
@@ -3776,7 +3806,25 @@ impl HubrisObjectLoader {
             structs_byname: MultiMap::new(),
             subprograms: HashMap::new(),
             syscall_pushes: HashMap::new(),
+            arch: None,
         }
+    }
+
+    /// Records the architecture the objects declare, refusing a mix.
+    fn set_arch(&mut self, arch: &'static dyn crate::arch::Arch) -> Result<()> {
+        match self.arch {
+            None => self.arch = Some(arch),
+            Some(prev) => {
+                if prev.elf_machine() != arch.elf_machine() {
+                    bail!(
+                        "mixed-architecture archive: {} vs {}",
+                        prev.name(),
+                        arch.name()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn merge(&mut self, loader: HubrisObjectLoader) -> Result<()> {
@@ -3792,6 +3840,9 @@ impl HubrisObjectLoader {
         self.loaded.extend(loader.loaded);
         self.instrs.extend(loader.instrs);
         self.syscall_pushes.extend(loader.syscall_pushes);
+        if let Some(arch) = loader.arch {
+            self.set_arch(arch)?;
+        }
         self.unions.extend(loader.unions);
         self.src.extend(loader.src);
         self.enums_byname.extend(loader.enums_byname);
@@ -3866,11 +3917,15 @@ impl HubrisObjectLoader {
             anyhow!("unrecognized ELF object: {}: {}", object, e)
         })?;
 
-        let arm = elf.header.e_machine == goblin::elf::header::EM_ARM;
-
-        if !arm {
-            bail!("{} not an ARM ELF object", object);
-        }
+        let arch = crate::arch::from_elf_machine(elf.header.e_machine)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: unsupported ELF machine {:#x}",
+                    object,
+                    elf.header.e_machine
+                )
+            })?;
+        self.set_arch(arch)?;
 
         let text = elf.section_headers.iter().find(|sh| {
             if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) {
@@ -3947,15 +4002,14 @@ impl HubrisObjectLoader {
             }
 
             //
-            // On ARM, we must explicitly clear the low bit of the symbol
-            // table, which exists only to indicate a function that contains
-            // Thumb instructions (which is of course every function on a
-            // microprocessor that executes only Thumb instructions).
+            // A function symbol's address may carry ISA tag bits -- on ARM,
+            // the low (Thumb) bit, which exists only to indicate a function
+            // containing Thumb instructions (which is of course every
+            // function on a microprocessor that executes only Thumb
+            // instructions). The architecture backend knows what to strip.
             //
-            assert!(arm);
-
             let val = if sym.is_function() {
-                sym.st_value as u32 & !1
+                arch.strip_fn_addr(sym.st_value as u32)
             } else {
                 sym.st_value as u32
             };
@@ -3995,7 +4049,9 @@ impl HubrisObjectLoader {
                     },
                 )?;
 
-                self.load_function(object, task, name, val, t, &cs)?;
+                if arch.has_instr_analysis() {
+                    self.load_function(object, task, name, val, t, &cs)?;
+                }
             }
         }
 

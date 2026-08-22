@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 
 use crate::hubris::*;
 use crate::mem::InMemoryCore;
-use humility_arch_arm::ARMRegister;
+use crate::reg::RegId;
 use humility_log::{Logger, info};
 use std::time::Duration;
 use thiserror::Error;
@@ -32,7 +32,7 @@ pub trait Core {
     }
 
     fn read_8(&mut self, addr: u32, data: &mut [u8]) -> Result<()>;
-    fn read_reg(&mut self, reg: ARMRegister) -> Result<u32>;
+    fn read_reg(&mut self, reg: RegId) -> Result<u32>;
     fn write_word_32(&mut self, addr: u32, data: u32) -> Result<()>;
     fn write_8(&mut self, addr: u32, data: &[u8]) -> Result<()>;
 

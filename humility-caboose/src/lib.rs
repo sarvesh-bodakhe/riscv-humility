@@ -79,7 +79,7 @@ pub fn read_tlvc_caboose(
     // image header, since we don't necessarily have our chip info here.
     core.halt().map_err(CabooseError::CouldNotHalt)?;
     let pc = core
-        .read_reg(humility_arch_arm::ARMRegister::PC)
+        .read_reg(humility_arch_arm::ARMRegister::PC.into())
         .map_err(CabooseError::CouldNotReadPc)?;
     core.run().map_err(CabooseError::CouldNotRun)?;
 

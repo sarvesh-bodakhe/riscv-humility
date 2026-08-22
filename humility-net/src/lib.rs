@@ -5,6 +5,7 @@
 //! Tools for using Humility over a network connection.
 
 use anyhow::{Context, Result, anyhow, bail};
+use humility::reg::RegId;
 use humility::{
     core::{Core, NetAgent, PreviousCpuState},
     hubris::{
@@ -13,7 +14,6 @@ use humility::{
     log::{Logger, info, warn},
     mem::InMemoryCore,
 };
-use humility_arch_arm::ARMRegister;
 use humility_dump_agent::{DumpAgent, DumpAgentExt, DumpArea, UdpDumpAgent};
 use std::{
     fmt,
@@ -354,7 +354,7 @@ impl Core for NetCore {
         self.read(addr, data)
     }
 
-    fn read_reg(&mut self, reg: ARMRegister) -> Result<u32> {
+    fn read_reg(&mut self, reg: RegId) -> Result<u32> {
         bail!("cannot read register {} over network", reg);
     }
 
