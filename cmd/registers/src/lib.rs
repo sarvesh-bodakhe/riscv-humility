@@ -231,6 +231,108 @@ fn print_reg(reg: ARMRegister, val: u32, fields: &[ARMRegisterField]) {
     println!();
 }
 
+//
+// The non-ARM rendering of the command: the register list, names, and
+// (absence of) bitfield decodes all come from the arch backend. The ARM
+// path below predates the arch abstraction and is left exactly as it
+// was; this one is what every subsequent architecture goes through.
+//
+fn registers_by_arch(
+    subargs: &RegistersArgs,
+    hubris: &HubrisArchive,
+    core: &mut dyn humility::core::Core,
+    log: &humility::log::Logger,
+) -> Result<()> {
+    let arch = hubris.arch();
+
+    if subargs.fp {
+        bail!("no floating-point registers on {}", arch.name());
+    }
+
+    core.halt()?;
+    let rval = print_registers_by_arch(subargs, hubris, core, log);
+    core.run()?;
+    rval
+}
+
+/// The body of [`registers_by_arch`], run with the core halted; split
+/// out so that the caller resumes the core whatever this returns.
+fn print_registers_by_arch(
+    subargs: &RegistersArgs,
+    hubris: &HubrisArchive,
+    core: &mut dyn humility::core::Core,
+    log: &humility::log::Logger,
+) -> Result<()> {
+    let arch = hubris.arch();
+
+    let regions = match hubris.regions(core) {
+        Ok(regions) => regions,
+        Err(err) => {
+            info!(log, "failed to determine memory regions: {err}");
+            BTreeMap::new()
+        }
+    };
+
+    //
+    // Read all of our registers first...
+    //
+    let mut regs = vec![];
+    for &reg in arch.display_regs() {
+        match core.read_reg(reg) {
+            Ok(val) => regs.push((reg, val)),
+            Err(_) => continue,
+        }
+    }
+
+    let printer = humility_stack::StackPrinter {
+        indent: 8,
+        line: subargs.line,
+        ..Default::default()
+    };
+
+    for &(reg, val) in &regs {
+        println!(
+            "{:>5} = 0x{:08x}{}",
+            arch.reg_name(reg).unwrap_or("?"),
+            val,
+            match hubris.explain(&regions, val) {
+                Some(explain) => format!(" <- {}", explain),
+                None => "".to_string(),
+            }
+        );
+
+        if subargs.stack && reg == arch.sp_reg() {
+            let Some((_, region)) = regions.range(..=val).next_back() else {
+                info!(log, "unknown region for sp 0x{val:08x}");
+                continue;
+            };
+
+            let task = if region.tasks.len() == 1 {
+                region.tasks[0]
+            } else {
+                info!(log, "multiple tasks map 0x{val:x}: {:?}", region.tasks);
+                continue;
+            };
+
+            let regid_regs: BTreeMap<humility::reg::RegId, u32> =
+                regs.iter().copied().collect();
+
+            match hubris.stack(
+                core,
+                task,
+                region.base + region.size,
+                &regid_regs,
+                log,
+            ) {
+                Ok(stack) => printer.print(hubris, &stack),
+                Err(e) => info!(log, "stack unwind failed: {e:?}"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn registers(
     subargs: RegistersArgs,
     context: &mut ExecutionContext,
@@ -238,6 +340,19 @@ fn registers(
     let hubris = &context.cli.try_archive()?;
     let log = context.log();
     let core = &mut *context.cli.attach_live_or_dump(hubris.as_ref(), None)?;
+
+    //
+    // Registers-by-DCRSR-number, xPSR bitfield art, and the MVFR0 probe
+    // below are all ARM-shaped; anything else takes the arch-driven path.
+    // (With no archive there is nothing to dispatch on, and the historic
+    // ARM behavior stands.)
+    //
+    if let Some(h) = hubris.as_ref()
+        && h.arch().elf_machine() != goblin::elf::header::EM_ARM
+    {
+        return registers_by_arch(&subargs, h, core, log);
+    }
+
     let mut regs = BTreeMap::new();
 
     if subargs.fp && !core.is_memory_core() {
