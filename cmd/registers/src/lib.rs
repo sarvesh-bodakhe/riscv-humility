@@ -331,11 +331,15 @@ fn registers(
                 // `regions` is empty if there's no Hubris archive, so we can
                 // unwrap it here:
                 let hubris = hubris.as_ref().unwrap();
+                // The unwinder takes transport-id-keyed registers; this
+                // command is ARM-shaped, so convert at the boundary.
+                let regid_regs: BTreeMap<humility::reg::RegId, u32> =
+                    regs.iter().map(|(r, v)| ((*r).into(), *v)).collect();
                 match hubris.stack(
                     core,
                     task,
                     region.base + region.size,
-                    &regs,
+                    &regid_regs,
                     log,
                 ) {
                     Ok(stack) => printer.print(hubris, &stack),

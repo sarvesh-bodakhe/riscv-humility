@@ -157,21 +157,24 @@ pub struct TasksArgs {
 
 fn print_regs(
     w: &mut dyn Write,
-    regs: &BTreeMap<ARMRegister, u32>,
+    hubris: &HubrisArchive,
+    regs: &BTreeMap<humility::reg::RegId, u32>,
     additional: bool,
 ) -> Result<()> {
+    let arch = hubris.arch();
     let bar = if additional { "|" } else { " " };
 
     write!(w, "   |\n   +--->")?;
 
-    for r in 0..=16 {
-        let reg = ARMRegister::from_usize(r).unwrap();
+    for (r, reg) in arch.display_regs().iter().enumerate() {
+        let name = arch.reg_name(*reg).unwrap_or("?");
 
         if r != 0 && r % 4 == 0 {
             write!(w, "   {}    ", bar)?;
         }
 
-        write!(w, "  {:>3} = 0x{:08x}", reg, regs.get(&reg).unwrap())?;
+        let val = regs.get(reg).copied().unwrap_or(0);
+        write!(w, "  {:>4} = 0x{:08x}", name, val)?;
 
         if r % 4 == 3 {
             writeln!(w)?;
@@ -439,7 +442,7 @@ pub fn print_tasks(
                         }
 
                         if registers {
-                            print_regs(w, &regs, verbose)?;
+                            print_regs(w, hubris, &regs, verbose)?;
                         }
                     }
                     Err(e) => {
@@ -523,17 +526,18 @@ fn stack_syscall<'a>(
     hubris: &'a HubrisArchive,
     t: HubrisTask,
     desc: &'a TaskDesc,
-    regs: &'a BTreeMap<ARMRegister, u32>,
+    regs: &'a BTreeMap<humility::reg::RegId, u32>,
     log: &Logger,
 ) -> Result<Vec<HubrisStackFrame<'a>>> {
+    let arch = hubris.arch();
     let pc = regs
-        .get(&ARMRegister::PC)
+        .get(&arch.pc_reg())
         .ok_or_else(|| anyhow!("PC missing from regs map"))?;
     let lr = regs
-        .get(&ARMRegister::LR)
+        .get(&arch.ret_reg())
         .ok_or_else(|| anyhow!("LR missing from regs map"))?;
     let sp = regs
-        .get(&ARMRegister::SP)
+        .get(&arch.sp_reg())
         .ok_or_else(|| anyhow!("SP missing from regs map"))?;
 
     let Some(pushed) = hubris.syscall_pushes_at(*pc) else {
@@ -544,12 +548,12 @@ fn stack_syscall<'a>(
     let mut frameregs = regs.clone();
     for (i, &p) in pushed.iter().enumerate() {
         let val = core.read_word_32(sp + (i * 4) as u32)?;
-        frameregs.insert(p, val);
+        frameregs.insert(p.into(), val);
     }
     // Move ourselves up a single frame.  This leaves SP with a fake value, but
     // it's in the correct region, which is what matters for `hubris.stack(..)`
-    frameregs.insert(ARMRegister::PC, *lr);
-    frameregs.remove(&ARMRegister::LR);
+    frameregs.insert(arch.pc_reg(), *lr);
+    frameregs.remove(&arch.ret_reg());
 
     let mut frames =
         hubris.stack(core, t, desc.initial_stack, &frameregs, log)?;
@@ -586,22 +590,23 @@ fn stack_guess<'a>(
     let reflect::Value::Struct(s) = &task_value else {
         bail!("invalid type for task_value")
     };
+    let arch = hubris.arch();
     let save = s.field::<reflect::Struct>("save")?;
-    let addr = save.field::<u32>("r7")?;
-    let pc = core.read_word_32(addr + 4)? & !1;
+    let addr = save.field::<u32>(arch.saved_fp_member())?;
+    let pc = arch.strip_fn_addr(core.read_word_32(addr + 4)?);
 
     let mut regs = BTreeMap::new();
-    regs.insert(ARMRegister::R7, addr);
-    regs.insert(ARMRegister::LR, addr);
+    regs.insert(arch.fp_reg(), addr);
+    regs.insert(arch.ret_reg(), addr);
 
     // Provide a dummy stack value to pick the
     // correct memory region
-    regs.insert(ARMRegister::SP, desc.initial_stack);
+    regs.insert(arch.sp_reg(), desc.initial_stack);
 
     // See if the previous instruction was a branch;
     // if so, use that as a fake PC
     regs.insert(
-        ARMRegister::PC,
+        arch.pc_reg(),
         if let Some(HubrisTarget::Call(t)) =
             pc.checked_sub(4).and_then(|pc| hubris.instr_target(pc))
         {

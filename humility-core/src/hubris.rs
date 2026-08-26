@@ -2662,11 +2662,12 @@ impl HubrisArchive {
         &self,
         core: &mut dyn crate::core::Core,
         t: HubrisTask,
-    ) -> Result<BTreeMap<ARMRegister, u32>> {
-        if !self.arch().has_unwind() {
+    ) -> Result<BTreeMap<crate::reg::RegId, u32>> {
+        let arch = self.arch();
+        if !arch.has_unwind() {
             bail!(
                 "register reconstruction is not yet implemented for {}",
-                self.arch().name()
+                arch.name()
             );
         }
 
@@ -2697,7 +2698,12 @@ impl HubrisArchive {
         // If this is the current task, we want to pull the current PC.
         //
         if cur == Some(t) {
-            let pc = core.read_reg(ARMRegister::PC.into())?;
+            //
+            // Reading live registers requires a halted hart on RISC-V
+            // (abstract commands fault on a running one); harmless on ARM.
+            //
+            core.halt()?;
+            let pc = core.read_reg(arch.pc_reg())?;
 
             //
             // If the PC falls within the task, then we are at user-level,
@@ -2712,20 +2718,29 @@ impl HubrisArchive {
                 };
 
             if userland {
-                for i in 0..=31 {
-                    let reg = match ARMRegister::from_u16(i) {
-                        Some(r) => r,
-                        None => {
-                            continue;
-                        }
-                    };
+                if let Some(members) = arch.save_members() {
+                    for (_, reg) in members {
+                        rval.insert(*reg, core.read_reg(*reg)?);
+                    }
+                    rval.insert(arch.pc_reg(), pc);
+                } else {
+                    for i in 0..=31 {
+                        let reg = match ARMRegister::from_u16(i) {
+                            Some(r) => r,
+                            None => {
+                                continue;
+                            }
+                        };
 
-                    let val = core.read_reg(reg.into())?;
-                    rval.insert(reg, val);
+                        let val = core.read_reg(reg.into())?;
+                        rval.insert(reg.into(), val);
+                    }
                 }
 
+                core.run()?;
                 return Ok(rval);
             }
+            core.run()?;
         };
 
         let readreg = |rname| -> Result<u32> {
@@ -2734,14 +2749,28 @@ impl HubrisArchive {
         };
 
         //
-        // R4-R11 are found in the structure.
+        // On a port whose trap machinery spills the whole register file
+        // into SavedState (the RISC-V port), reconstruction is nothing
+        // but reading it back out: no hardware exception frame, no
+        // FPU-frame heuristics, no realignment.
+        //
+        if let Some(members) = arch.save_members() {
+            for (name, reg) in members {
+                rval.insert(*reg, readreg(name)?);
+            }
+            return Ok(rval);
+        }
+
+        //
+        // The ARM split-state reconstruction: R4-R11 are found in the
+        // structure.
         //
         for r in 4..=11 {
             let rname = format!("r{}", r);
             let o = state.lookup_member(&rname)?.offset;
             let val = u32::from_le_bytes(regs[o..o + 4].try_into().unwrap());
 
-            rval.insert(ARMRegister::from_usize(r).unwrap(), val);
+            rval.insert(ARMRegister::from_usize(r).unwrap().into(), val);
         }
 
         let sp = readreg("psp")?;
@@ -2768,7 +2797,7 @@ impl HubrisArchive {
                 _ => panic!("bad register value"),
             };
 
-            rval.insert(reg, val);
+            rval.insert(reg.into(), val);
         }
 
         //
@@ -2790,10 +2819,20 @@ impl HubrisArchive {
         // We manually adjust our stack pointer to peel off the entire frame,
         // plus any needed re-alignment.
         //
+        //
+        // exception_stack_realign wants the PSR by ARM register; give it
+        // a view it understands.
+        //
+        let arm_view: BTreeMap<ARMRegister, u32> = rval
+            .iter()
+            .filter_map(|(reg, v)| {
+                ARMRegister::from_u16(reg.0).map(|r| (r, *v))
+            })
+            .collect();
         let adjust = (nregs_frame as u32) * 4
-            + humility_arch_arm::exception_stack_realign(&rval);
+            + humility_arch_arm::exception_stack_realign(&arm_view);
 
-        rval.insert(ARMRegister::SP, sp + adjust);
+        rval.insert(ARMRegister::SP.into(), sp + adjust);
 
         Ok(rval)
     }
@@ -2803,15 +2842,16 @@ impl HubrisArchive {
         core: &mut dyn crate::core::Core,
         task: HubrisTask,
         limit: u32,
-        regs: &BTreeMap<ARMRegister, u32>,
+        regs: &BTreeMap<crate::reg::RegId, u32>,
         log: &Logger,
     ) -> Result<Vec<HubrisStackFrame<'_>>> {
+        let arch = self.arch();
         let regions = self.regions(core)?;
         let sp = regs
-            .get(&ARMRegister::SP)
+            .get(&arch.sp_reg())
             .ok_or_else(|| anyhow!("SP missing from regs map"))?;
         let pc = regs
-            .get(&ARMRegister::PC)
+            .get(&arch.pc_reg())
             .ok_or_else(|| anyhow!("PC missing from regs map"))?;
 
         let mut rval: Vec<HubrisStackFrame> = Vec::new();
@@ -2849,10 +2889,10 @@ impl HubrisArchive {
         if let Some(Some(pushed)) = self.syscall_pushes.get(pc) {
             for (i, &p) in pushed.iter().enumerate() {
                 let val = readval(sp + (i * 4) as u32)?;
-                frameregs.insert(p, val);
+                frameregs.insert(p.into(), val);
             }
 
-            frameregs.insert(ARMRegister::SP, sp + (pushed.len() * 4) as u32);
+            frameregs.insert(arch.sp_reg(), sp + (pushed.len() * 4) as u32);
         }
 
         let frames = self
@@ -2866,12 +2906,23 @@ impl HubrisArchive {
         loop {
             let bases = gimli::BaseAddresses::default();
             let mut ctx = gimli::UnwindContext::new();
-            let pc = *frameregs.get(&ARMRegister::PC).unwrap();
+            let pc = *frameregs.get(&arch.pc_reg()).unwrap();
+
+            //
+            // For every frame past the first, `pc` is a *return* address:
+            // it points at the instruction after the call, which can
+            // belong to the next source line -- or, with aggressive
+            // inlining, to a different function entirely. Symbolize the
+            // call itself by backing up one byte; the unwind tables still
+            // get the true pc, since CFI rows change between
+            // instructions.
+            //
+            let lookup_pc = if rval.is_empty() { pc } else { pc - 1 };
 
             // Look up the `addr2line` info for the current pc
             let mut pos = vec![];
             let mut pos_valid = true;
-            match self.addr2line[&task].find_frames(u64::from(pc)) {
+            match self.addr2line[&task].find_frames(u64::from(lookup_pc)) {
                 addr2line::LookupResult::Load { .. } => {
                     warn!(log, "addr2line wants to load extern data");
                     pos_valid = false;
@@ -2903,73 +2954,99 @@ impl HubrisArchive {
             //
             // Now we want to iterate up our frames
             //
-            let unwind_info = frame.unwind_info_for_address(
+            let cfa = match frame.unwind_info_for_address(
                 &bases,
                 &mut ctx,
                 pc as u64,
                 gimli::DebugFrame::cie_from_offset,
-            )?;
+            ) {
+                Ok(unwind_info) => {
+                    //
+                    // Determine the CFA (Canonical Frame Address)
+                    //
+                    let cfa = match unwind_info.cfa() {
+                        gimli::CfaRule::RegisterAndOffset {
+                            register,
+                            offset,
+                        } => {
+                            if let Some(reg) = arch.dwarf_reg(register.0) {
+                                *frameregs.get(&reg).unwrap() + *offset as u32
+                            } else {
+                                // A register we don't model -- that's OK.
+                                continue;
+                            }
+                        }
+                        _ => {
+                            panic!("unimplemented CFA rule");
+                        }
+                    };
 
-            //
-            // Determine the CFA (Canonical Frame Address)
-            //
-            let cfa = match unwind_info.cfa() {
-                gimli::CfaRule::RegisterAndOffset { register, offset } => {
-                    if let Some(reg) = ARMRegister::from_u16(register.0) {
-                        *frameregs.get(&reg).unwrap() + *offset as u32
-                    } else {
-                        // A register we don't model -- that's OK.
-                        continue;
+                    //
+                    // Now iterate over all of our register rules to
+                    // transform our registers.
+                    //
+                    for (register, rule) in unwind_info.registers() {
+                        let val = match rule {
+                            gimli::RegisterRule::Offset(offset) => {
+                                readval((i64::from(cfa) + offset) as u32)
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to read cfa 0x{:x}, \
+                                     offset 0x{:x}: {:x?}",
+                                            cfa, offset, rval
+                                        )
+                                    })?
+                            }
+                            _ => {
+                                panic!("unimplemented register rule");
+                            }
+                        };
+
+                        if let Some(reg) = arch.dwarf_reg(register.0) {
+                            frameregs.insert(reg, val);
+                        } else {
+                            // Skip register we don't model.
+                            continue;
+                        }
                     }
+
+                    cfa
                 }
-                _ => {
-                    panic!("unimplemented CFA rule");
+                Err(e) => {
+                    //
+                    // No frame info covers this pc. For any frame past
+                    // the first, that is the natural end of the walk.
+                    // For the *first* frame it means the task is parked
+                    // in hand-written assembly with no CFI (a syscall
+                    // stub): treat it as a leaf -- the return address is
+                    // still in the return register and sp is unmoved --
+                    // and let the loop's tail hop through it.
+                    //
+                    if !rval.is_empty() {
+                        break;
+                    }
+                    if !frameregs.contains_key(&arch.ret_reg()) {
+                        return Err(e.into());
+                    }
+                    *frameregs.get(&arch.sp_reg()).unwrap()
                 }
             };
 
-            //
-            // Now iterate over all of our register rules to transform
-            // our registers.
-            //
-            for (register, rule) in unwind_info.registers() {
-                let val = match rule {
-                    gimli::RegisterRule::Offset(offset) => readval(
-                        (i64::from(cfa) + offset) as u32,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "failed to read cfa 0x{:x}, offset 0x{:x}: {:x?}",
-                            cfa, offset, rval
-                        )
-                    })?,
-                    _ => {
-                        panic!("unimplemented register rule");
-                    }
-                };
-
-                if let Some(reg) = ARMRegister::from_u16(register.0) {
-                    frameregs.insert(reg, val);
-                } else {
-                    // Skip register we don't model.
-                    continue;
-                }
-            }
-
-            frameregs.insert(ARMRegister::SP, cfa);
+            frameregs.insert(arch.sp_reg(), cfa);
 
             //
             // Lookup the DWARF symbol associated with our PC
             //
-            let sym = match self.dsyms.range(..=pc).next_back() {
-                Some((addr, sym)) if pc < *addr + sym.size => {
+            let sym = match self.dsyms.range(..=lookup_pc).next_back() {
+                Some((addr, sym)) if lookup_pc < *addr + sym.size => {
                     Some(HubrisStackSymbol {
                         addr: sym.addr,
                         name: &sym.demangled_name,
                         goff: Some(sym.goff),
                     })
                 }
-                _ => match self.esyms.range(..=pc).next_back() {
-                    Some((addr, (name, len))) if pc < *addr + *len => {
+                _ => match self.esyms.range(..=lookup_pc).next_back() {
+                    Some((addr, (name, len))) if lookup_pc < *addr + *len => {
                         Some(HubrisStackSymbol {
                             addr: *addr,
                             name,
@@ -2985,7 +3062,7 @@ impl HubrisArchive {
             //
             let inlined = match &sym {
                 Some(sym) => {
-                    let mut inlined = self.instr_inlined(pc, sym.addr);
+                    let mut inlined = self.instr_inlined(lookup_pc, sym.addr);
                     inlined.reverse();
                     Some(inlined)
                 }
@@ -3003,22 +3080,24 @@ impl HubrisArchive {
                 registers: frameregs.clone(),
             });
 
-            let lr = *frameregs.get(&ARMRegister::LR).unwrap();
+            let Some(&lr) = frameregs.get(&arch.ret_reg()) else {
+                break;
+            };
 
             //
-            // If this is a kernel stack and we have hit an EXC_RETURN, we're
-            // done.
+            // If this is a kernel stack and we have hit the architecture's
+            // exception-return sentinel (ARM's EXC_RETURN), we're done.
             //
-            if task == HubrisTask::Kernel && (lr >> 28 == 0xf) {
+            if task == HubrisTask::Kernel && arch.is_exception_return(lr) {
                 break;
             }
 
             //
-            // Make sure that the low (Thumb) bit is clear
+            // Make sure any ISA tag bits (the Thumb bit) are clear.
             //
-            let lr = lr & !1;
+            let lr = arch.strip_fn_addr(lr);
 
-            frameregs.insert(ARMRegister::PC, lr);
+            frameregs.insert(arch.pc_reg(), lr);
 
             if cfa >= limit {
                 break;
@@ -6333,7 +6412,7 @@ pub struct HubrisStackFrame<'a> {
     /// Position as decoded by `addr2line` (empty if unknown)
     pub pos: Option<Vec<HubrisSrcPosition>>,
     /// Register state at this point in the stack
-    pub registers: BTreeMap<ARMRegister, u32>,
+    pub registers: BTreeMap<crate::reg::RegId, u32>,
     /// Inlined functions in the stack
     pub inlined: Option<Vec<HubrisInlined<'a>>>,
 }
@@ -6706,6 +6785,14 @@ fn dwarf_name<R: gimli::Reader<Offset = usize>>(
         gimli::AttributeValue::DebugStrRef(strref) => {
             let dstring = dwarf.debug_str.get_str(strref).ok()?;
             dstring.to_string().ok().map(|s| s.to_string())
+        }
+        //
+        // DW_FORM_string: the string is inline in .debug_info. The riscv
+        // Hubris builds emit all strings this way (see the port's
+        // -dwarf-inlined-strings rationale in its build system).
+        //
+        gimli::AttributeValue::String(ds) => {
+            ds.to_string().ok().map(|s| s.to_string())
         }
         _ => None,
     }

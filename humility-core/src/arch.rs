@@ -56,6 +56,52 @@ pub trait Arch: Send + Sync {
     fn has_unwind(&self) -> bool {
         false
     }
+
+    /// The stack pointer, as named on the debug transport.
+    fn sp_reg(&self) -> RegId;
+
+    /// The return-address register (`lr` on ARM, `ra` on RISC-V).
+    fn ret_reg(&self) -> RegId;
+
+    /// Maps a DWARF register number (as used by CFI rules) to the
+    /// transport register id. The numbering is per-architecture and NOT
+    /// the transport numbering -- conflating the two happens to work on
+    /// ARM (both count r0..r15 from zero) and silently corrupts on
+    /// everything else, which is why this hook exists.
+    fn dwarf_reg(&self, n: u16) -> Option<RegId>;
+
+    /// The architecture's name for a register, for display.
+    fn reg_name(&self, reg: RegId) -> Option<&'static str>;
+
+    /// Registers worth showing a human, in display order.
+    fn display_regs(&self) -> &'static [RegId];
+
+    /// When the port's trap machinery saves the *entire* register file
+    /// into the Task's `SavedState` (the RISC-V port does), this returns
+    /// the member name and transport id of every saved register, and
+    /// register reconstruction is a single struct read. `None` means the
+    /// state is split and the architecture needs its own reconstruction
+    /// (ARM: hardware pushes half the file onto the task stack).
+    fn save_members(&self) -> Option<&'static [(&'static str, RegId)]> {
+        None
+    }
+
+    /// The `SavedState` member holding the frame-pointer-ish register
+    /// used by heuristic stack guessing (`r7` on ARM Hubris, `s0` on
+    /// RISC-V).
+    fn saved_fp_member(&self) -> &'static str;
+
+    /// The transport id of that same frame-pointer-ish register.
+    fn fp_reg(&self) -> RegId;
+
+    /// Whether a return-address value marks the exception/kernel
+    /// boundary, ending a kernel stack walk (ARM's EXC_RETURN). No such
+    /// sentinel exists on RISC-V; its walks end at the stack limit or
+    /// when no frame info covers the pc.
+    fn is_exception_return(&self, ra: u32) -> bool {
+        let _ = ra;
+        false
+    }
 }
 
 /// The ARM Cortex-M backend: everything Humility historically assumed.
@@ -100,16 +146,83 @@ impl Arch for ArmM {
     fn has_unwind(&self) -> bool {
         true
     }
+
+    fn sp_reg(&self) -> RegId {
+        ARMRegister::SP.into()
+    }
+
+    fn ret_reg(&self) -> RegId {
+        ARMRegister::LR.into()
+    }
+
+    /// ARM DWARF numbering (r0..r15 = 0..15) coincides with the DCRSR
+    /// transport numbering, so this is (validated) identity.
+    fn dwarf_reg(&self, n: u16) -> Option<RegId> {
+        use num_traits::FromPrimitive;
+        ARMRegister::from_u16(n).map(RegId::from)
+    }
+
+    fn reg_name(&self, reg: RegId) -> Option<&'static str> {
+        use num_traits::FromPrimitive;
+        ARMRegister::from_u16(reg.0).map(|r| match r {
+            ARMRegister::R0 => "r0",
+            ARMRegister::R1 => "r1",
+            ARMRegister::R2 => "r2",
+            ARMRegister::R3 => "r3",
+            ARMRegister::R4 => "r4",
+            ARMRegister::R5 => "r5",
+            ARMRegister::R6 => "r6",
+            ARMRegister::R7 => "r7",
+            ARMRegister::R8 => "r8",
+            ARMRegister::R9 => "r9",
+            ARMRegister::R10 => "r10",
+            ARMRegister::R11 => "r11",
+            ARMRegister::R12 => "r12",
+            ARMRegister::SP => "sp",
+            ARMRegister::LR => "lr",
+            ARMRegister::PC => "pc",
+            ARMRegister::PSR => "xpsr",
+            _ => "?",
+        })
+    }
+
+    fn display_regs(&self) -> &'static [RegId] {
+        //
+        // r0..r12, sp, lr, pc, xPSR -- the DCRSR encodings, which
+        // ARMRegister's discriminants are: 0..=15 then 16 (xPSR).
+        //
+        const REGS: [RegId; 17] = {
+            let mut r = [RegId(0); 17];
+            let mut i = 0;
+            while i < 17 {
+                r[i] = RegId(i as u16);
+                i += 1;
+            }
+            r
+        };
+        &REGS
+    }
+
+    fn saved_fp_member(&self) -> &'static str {
+        "r7"
+    }
+
+    fn fp_reg(&self) -> RegId {
+        ARMRegister::R7.into()
+    }
+
+    fn is_exception_return(&self, ra: u32) -> bool {
+        ra >> 28 == 0xf
+    }
 }
 
 /// The RV32 backend, for Hubris on RISC-V; the ESP32-C6 is its first
 /// target.
 ///
-/// Register reconstruction, stack unwinding and instruction analysis are
-/// not implemented yet -- the corresponding capabilities report false and
-/// their consumers refuse cleanly. What is implemented is everything the
-/// memory-and-reflection commands need: `tasks` (plain), `readmem`,
-/// `map`, `manifest`.
+/// Instruction analysis (capstone passes) is not implemented yet and its
+/// capability reports false; everything else -- reflection, register
+/// reconstruction from the port's whole-file `SavedState`, and DWARF CFI
+/// stack unwinding -- is.
 pub struct Riscv32;
 
 impl Arch for Riscv32 {
@@ -146,7 +259,103 @@ impl Arch for Riscv32 {
             _ => return None,
         })
     }
+
+    fn has_unwind(&self) -> bool {
+        true
+    }
+
+    fn sp_reg(&self) -> RegId {
+        RegId(0x1002) // x2
+    }
+
+    fn ret_reg(&self) -> RegId {
+        RegId(0x1001) // x1, ra
+    }
+
+    /// RISC-V DWARF numbering is x0..x31 = 0..31; the transport numbers
+    /// the same registers 0x1000..0x101f.
+    fn dwarf_reg(&self, n: u16) -> Option<RegId> {
+        if n < 32 { Some(RegId(0x1000 + n)) } else { None }
+    }
+
+    fn reg_name(&self, reg: RegId) -> Option<&'static str> {
+        if reg == self.pc_reg() {
+            return Some("pc");
+        }
+        let n = reg.0.checked_sub(0x1000)?;
+        RISCV_SAVE_MEMBERS
+            .iter()
+            .find(|(_, r)| r.0 == 0x1000 + n)
+            .map(|(name, _)| *name)
+    }
+
+    fn display_regs(&self) -> &'static [RegId] {
+        //
+        // pc then x1..x31, in transport numbering.
+        //
+        const REGS: [RegId; 32] = {
+            let mut r = [RegId(0x7b1); 32];
+            let mut i = 1;
+            while i < 32 {
+                r[i] = RegId(0x1000 + i as u16);
+                i += 1;
+            }
+            r
+        };
+        &REGS
+    }
+
+    fn save_members(&self) -> Option<&'static [(&'static str, RegId)]> {
+        Some(RISCV_SAVE_MEMBERS)
+    }
+
+    fn saved_fp_member(&self) -> &'static str {
+        "s0"
+    }
+
+    fn fp_reg(&self) -> RegId {
+        RegId(0x1008) // x8, s0
+    }
 }
+
+/// The RISC-V port's `SavedState` members and their transport ids: the
+/// whole integer file in x-order (the trap entry spills it contiguously),
+/// then the pc (from `mepc`). Names match the struct definition in
+/// `sys/kern/src/arch/riscv32.rs`.
+const RISCV_SAVE_MEMBERS: &[(&str, RegId)] = &[
+    ("ra", RegId(0x1001)),
+    ("sp", RegId(0x1002)),
+    ("gp", RegId(0x1003)),
+    ("tp", RegId(0x1004)),
+    ("t0", RegId(0x1005)),
+    ("t1", RegId(0x1006)),
+    ("t2", RegId(0x1007)),
+    ("s0", RegId(0x1008)),
+    ("s1", RegId(0x1009)),
+    ("a0", RegId(0x100a)),
+    ("a1", RegId(0x100b)),
+    ("a2", RegId(0x100c)),
+    ("a3", RegId(0x100d)),
+    ("a4", RegId(0x100e)),
+    ("a5", RegId(0x100f)),
+    ("a6", RegId(0x1010)),
+    ("a7", RegId(0x1011)),
+    ("s2", RegId(0x1012)),
+    ("s3", RegId(0x1013)),
+    ("s4", RegId(0x1014)),
+    ("s5", RegId(0x1015)),
+    ("s6", RegId(0x1016)),
+    ("s7", RegId(0x1017)),
+    ("s8", RegId(0x1018)),
+    ("s9", RegId(0x1019)),
+    ("s10", RegId(0x101a)),
+    ("s11", RegId(0x101b)),
+    ("t3", RegId(0x101c)),
+    ("t4", RegId(0x101d)),
+    ("t5", RegId(0x101e)),
+    ("t6", RegId(0x101f)),
+    ("pc", RegId(0x7b1)),
+];
 
 /// Returns the backend for an ELF `e_machine`, if the architecture is
 /// known.

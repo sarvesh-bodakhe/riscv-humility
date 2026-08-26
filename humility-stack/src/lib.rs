@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use humility::hubris::*;
-use humility_arch_arm::ARMRegister;
 
 #[derive(Debug, Default)]
 pub struct StackPrinter {
@@ -36,7 +35,7 @@ impl StackPrinter {
         let fixup_file = |input| pattern.replace_all(input, "/build/");
 
         for (ndx, frame) in stack.iter().enumerate() {
-            let pc = frame.registers.get(&ARMRegister::PC).unwrap();
+            let pc = frame.registers.get(&hubris.arch().pc_reg()).unwrap();
 
             if let Some(pos) = &frame.pos {
                 for (i, p) in pos.iter().enumerate() {
