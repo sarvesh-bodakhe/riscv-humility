@@ -3317,15 +3317,6 @@ impl HubrisArchive {
         use indicatif::{HumanBytes, HumanDuration};
         use indicatif::{ProgressBar, ProgressStyle};
 
-        //
-        // The dump format tags its architecture only via e_machine, and
-        // both the register slurp below and readers of the result assume
-        // ARM; this is revisited when dumps come to the RISC-V port.
-        //
-        if self.arch().elf_machine() != goblin::elf::header::EM_ARM {
-            bail!("dumps are not yet implemented for {}", self.arch().name());
-        }
-
         let segments = self.dump_segments(core, task, true)?;
         let nsegs = segments.len();
 
@@ -3365,11 +3356,9 @@ impl HubrisArchive {
             }
 
             None => {
-                for i in 0..31 {
-                    if let Some(reg) = ARMRegister::from_u16(i) {
-                        let val = core.read_reg(reg.into())?;
-                        regs.push((i, val));
-                    }
+                for reg in self.arch().dump_regs() {
+                    let val = core.read_reg(reg)?;
+                    regs.push((reg.0 as u32, val));
                 }
 
                 notes.push(goblin::elf::note::Nhdr32 {
@@ -3387,7 +3376,7 @@ impl HubrisArchive {
         });
 
         let mut header = goblin::elf::header::Header::new(ctx);
-        header.e_machine = goblin::elf::header::EM_ARM;
+        header.e_machine = self.arch().elf_machine();
         header.e_type = goblin::elf::header::ET_CORE;
         header.e_phoff = header.e_ehsize as u64;
         header.e_phnum = (notes.len() + nsegs) as u16;

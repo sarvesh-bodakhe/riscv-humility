@@ -76,6 +76,12 @@ pub trait Arch: Send + Sync {
     /// Registers worth showing a human, in display order.
     fn display_regs(&self) -> &'static [RegId];
 
+    /// Registers a core dump captures into its `OXIDE_NT_HUBRIS_REGISTERS`
+    /// note, as transport ids. The note stores (id, value) pairs, so the
+    /// reader needs no per-architecture knowledge; this list is the
+    /// writer's half of that contract.
+    fn dump_regs(&self) -> Vec<RegId>;
+
     /// When the port's trap machinery saves the *entire* register file
     /// into the Task's `SavedState` (the RISC-V port does), this returns
     /// the member name and transport id of every saved register, and
@@ -230,6 +236,18 @@ impl Arch for ArmM {
         &REGS
     }
 
+    fn dump_regs(&self) -> Vec<RegId> {
+        use num_traits::FromPrimitive;
+        //
+        // Exactly the set the ARM-only dump writer always captured: every
+        // DCRSR id below 31 that names a register (r0..r12, sp, lr, pc,
+        // xpsr, msp, psp, spr) -- existing dump consumers depend on it.
+        //
+        (0..31u16)
+            .filter_map(|i| ARMRegister::from_u16(i).map(RegId::from))
+            .collect()
+    }
+
     fn saved_fp_member(&self) -> &'static str {
         "r7"
     }
@@ -334,6 +352,14 @@ impl Arch for Riscv32 {
 
     fn save_members(&self) -> Option<&'static [(&'static str, RegId)]> {
         Some(RISCV_SAVE_MEMBERS)
+    }
+
+    fn dump_regs(&self) -> Vec<RegId> {
+        //
+        // The whole integer file plus pc -- the same set SavedState
+        // holds, so a dump can answer anything the live probe could.
+        //
+        RISCV_SAVE_MEMBERS.iter().map(|&(_, r)| r).collect()
     }
 
     fn has_cfi_less_leaf_stubs(&self) -> bool {
