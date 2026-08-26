@@ -102,6 +102,28 @@ pub trait Arch: Send + Sync {
         let _ = ra;
         false
     }
+
+    /// Bias subtracted from a return address before symbolizing the
+    /// frame below the top, so it names the *call* rather than the
+    /// instruction after it. The correction is equally valid on every
+    /// architecture, but the ARM backend keeps the historic unbiased
+    /// lookup: years of Humility output (and its recorded test
+    /// expectations) pin it, and diverging from upstream there buys
+    /// nothing but merge pain.
+    fn ret_addr_symbolize_bias(&self) -> u32 {
+        0
+    }
+
+    /// Whether the port's syscall stubs are true leaves with no CFI --
+    /// they never touch sp or ra, so a task parked in one can be
+    /// unwound by treating the first frame as a leaf (return address
+    /// still in the return register, sp unmoved). The RISC-V stubs are
+    /// this shape. ARM's stubs push a frame and carry CFI, so a
+    /// first-frame CFI miss there is a genuine unknown and must stay
+    /// an error, as it always has.
+    fn has_cfi_less_leaf_stubs(&self) -> bool {
+        false
+    }
 }
 
 /// The ARM Cortex-M backend: everything Humility historically assumed.
@@ -162,26 +184,31 @@ impl Arch for ArmM {
         ARMRegister::from_u16(n).map(RegId::from)
     }
 
+    //
+    // These are ARMRegister's own Display forms: the names (and the
+    // uppercase) are what Humility has always printed, and the trycmd
+    // expectations pin them.
+    //
     fn reg_name(&self, reg: RegId) -> Option<&'static str> {
         use num_traits::FromPrimitive;
         ARMRegister::from_u16(reg.0).map(|r| match r {
-            ARMRegister::R0 => "r0",
-            ARMRegister::R1 => "r1",
-            ARMRegister::R2 => "r2",
-            ARMRegister::R3 => "r3",
-            ARMRegister::R4 => "r4",
-            ARMRegister::R5 => "r5",
-            ARMRegister::R6 => "r6",
-            ARMRegister::R7 => "r7",
-            ARMRegister::R8 => "r8",
-            ARMRegister::R9 => "r9",
-            ARMRegister::R10 => "r10",
-            ARMRegister::R11 => "r11",
-            ARMRegister::R12 => "r12",
-            ARMRegister::SP => "sp",
-            ARMRegister::LR => "lr",
-            ARMRegister::PC => "pc",
-            ARMRegister::PSR => "xpsr",
+            ARMRegister::R0 => "R0",
+            ARMRegister::R1 => "R1",
+            ARMRegister::R2 => "R2",
+            ARMRegister::R3 => "R3",
+            ARMRegister::R4 => "R4",
+            ARMRegister::R5 => "R5",
+            ARMRegister::R6 => "R6",
+            ARMRegister::R7 => "R7",
+            ARMRegister::R8 => "R8",
+            ARMRegister::R9 => "R9",
+            ARMRegister::R10 => "R10",
+            ARMRegister::R11 => "R11",
+            ARMRegister::R12 => "R12",
+            ARMRegister::SP => "SP",
+            ARMRegister::LR => "LR",
+            ARMRegister::PC => "PC",
+            ARMRegister::PSR => "PSR",
             _ => "?",
         })
     }
@@ -307,6 +334,14 @@ impl Arch for Riscv32 {
 
     fn save_members(&self) -> Option<&'static [(&'static str, RegId)]> {
         Some(RISCV_SAVE_MEMBERS)
+    }
+
+    fn has_cfi_less_leaf_stubs(&self) -> bool {
+        true
+    }
+
+    fn ret_addr_symbolize_bias(&self) -> u32 {
+        1
     }
 
     fn saved_fp_member(&self) -> &'static str {

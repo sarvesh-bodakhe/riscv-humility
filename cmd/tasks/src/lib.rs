@@ -117,10 +117,8 @@ use humility::core::Core;
 use humility::hubris::*;
 use humility::log::{Logger, debug, info, warn};
 use humility::reflect::{self, Format, Load};
-use humility_arch_arm::ARMRegister;
 use humility_cli::{ExecutionContext, humility_cmd};
 use humility_doppel::{self as doppel, Task, TaskDesc, TaskId, TaskState};
-use num_traits::FromPrimitive;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
@@ -174,7 +172,7 @@ fn print_regs(
         }
 
         let val = regs.get(reg).copied().unwrap_or(0);
-        write!(w, "  {:>4} = 0x{:08x}", name, val)?;
+        write!(w, "  {:>3} = 0x{:08x}", name, val)?;
 
         if r % 4 == 3 {
             writeln!(w)?;

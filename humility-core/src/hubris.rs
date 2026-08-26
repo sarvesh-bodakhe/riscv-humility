@@ -2917,7 +2917,11 @@ impl HubrisArchive {
             // get the true pc, since CFI rows change between
             // instructions.
             //
-            let lookup_pc = if rval.is_empty() { pc } else { pc - 1 };
+            let lookup_pc = if rval.is_empty() {
+                pc
+            } else {
+                pc - arch.ret_addr_symbolize_bias()
+            };
 
             // Look up the `addr2line` info for the current pc
             let mut pos = vec![];
@@ -3025,7 +3029,9 @@ impl HubrisArchive {
                     if !rval.is_empty() {
                         break;
                     }
-                    if !frameregs.contains_key(&arch.ret_reg()) {
+                    if !arch.has_cfi_less_leaf_stubs()
+                        || !frameregs.contains_key(&arch.ret_reg())
+                    {
                         return Err(e.into());
                     }
                     *frameregs.get(&arch.sp_reg()).unwrap()
