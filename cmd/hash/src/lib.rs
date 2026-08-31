@@ -228,6 +228,11 @@ fn hash(subargs: HashArgs, context: &mut ExecutionContext) -> Result<()> {
                         }
                     }
                 }
+                // The chunked path has already issued every operation
+                // (and, for --digest, printed the result); falling
+                // through would issue the plain single-shot call a
+                // second time on top of the finished session.
+                return Ok(());
             } else {
                 // For update and digest that fit in a single hubris scratch buf,
                 // push the length of data to be sent.
