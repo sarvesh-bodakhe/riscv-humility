@@ -130,6 +130,16 @@ pub trait Arch: Send + Sync {
     fn has_cfi_less_leaf_stubs(&self) -> bool {
         false
     }
+
+    /// Whether the core must be running when the probe's reset pin is
+    /// pulled. A RISC-V Debug Module need not be reset along with the
+    /// system: one that held the hart halted is then left waiting on a
+    /// hart that has rebooted, and refuses every later attach. Seen on
+    /// the ESP32-C6, where `abstractcs.busy` stays set until something
+    /// issues a halt request. ARM's pin reset has no such precondition.
+    fn pin_reset_needs_running_core(&self) -> bool {
+        false
+    }
 }
 
 /// The ARM Cortex-M backend: everything Humility historically assumed.
@@ -306,6 +316,10 @@ impl Arch for Riscv32 {
     }
 
     fn has_unwind(&self) -> bool {
+        true
+    }
+
+    fn pin_reset_needs_running_core(&self) -> bool {
         true
     }
 

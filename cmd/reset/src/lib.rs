@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use humility::core::Core;
 use humility::log::info;
 use humility_cli::{ExecutionContext, humility_cmd};
 
@@ -100,6 +101,33 @@ fn reset(subargs: ResetArgs, context: &mut ExecutionContext) -> Result<()> {
             Behavior::Reset => c.reset(),
         }
     } else {
+        //
+        // On an architecture whose debug logic outlives the pin reset, a
+        // core that is halted when the pin is pulled leaves that logic
+        // stuck, and nothing attaches afterwards.  Resume the core first.
+        // That takes the chip, and so an archive: without one the pin is
+        // pulled as it always was.  A failure here is not fatal, because
+        // the reset may be the very thing that is needed.
+        //
+        if let Some(hubris) = &hubris
+            && hubris.arch().pin_reset_needs_running_core()
+        {
+            let resumed = hubris.chip().and_then(|chip| {
+                let mut c = humility_probes_core::attach_to_chip(
+                    probe,
+                    Some(&chip),
+                    context.cli.speed,
+                    log,
+                )?;
+                c.halt()?;
+                c.run()?;
+                Ok(())
+            });
+            if let Err(e) = resumed {
+                info!(log, "could not resume the core before reset: {e:#}");
+            }
+        }
+
         let mut probe = humility_probes_core::attach_to_probe(
             probe,
             context.cli.speed,
