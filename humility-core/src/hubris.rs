@@ -1056,6 +1056,18 @@ pub type HubrisDataMap = datamap::OwnedDataMap<u32>;
 pub struct HubrisFlashMeta {
     /// Chip name used by probe-rs.
     pub chip: Option<String>,
+    /// What to write to flash, and where, on a chip whose boot ROM loads
+    /// a wrapped image from flash instead of running the linked one in
+    /// place. Without it, `img/final.elf` goes where it is linked.
+    pub boot_image: Option<HubrisBootImage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HubrisBootImage {
+    /// Path of the image within the archive.
+    pub path: String,
+    /// Flash address to write it at.
+    pub address: u32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1583,6 +1595,23 @@ impl HubrisArchive {
     pub fn load_flash_elf(&self) -> Result<Vec<u8>> {
         let data = self.hubris_archive.extract_file("img/final.elf")?;
         Ok(data)
+    }
+
+    /// Returns the image the archive's flash metadata names for the boot
+    /// ROM and the flash address it goes at, if it names one; see
+    /// [`HubrisFlashMeta::boot_image`].
+    pub fn load_boot_image(&self) -> Result<Option<(u32, Vec<u8>)>> {
+        let Some(image) = self.load_flash_meta()?.boot_image else {
+            return Ok(None);
+        };
+        let data =
+            self.hubris_archive.extract_file(&image.path).map_err(|e| {
+                anyhow!(
+                    "flash metadata names {}, not in the archive: {e}",
+                    image.path
+                )
+            })?;
+        Ok(Some((image.address, data)))
     }
 
     /// Returns [`HubrisFlashMeta`] from the archive

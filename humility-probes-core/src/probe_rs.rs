@@ -428,6 +428,41 @@ impl std::fmt::Display for VidPid {
 
 impl ProbeCore {
     pub fn load(&mut self, elf_data: &[u8]) -> Result<(), LoadError> {
+        self.load_with(false, |loader, session| {
+            loader.load_image(
+                session,
+                &mut std::io::Cursor::new(elf_data),
+                Format::Elf(ElfOptions::default()),
+                None,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Writes `data` to flash at `address`, and reads it back.
+    ///
+    /// For an image that is not written where it is linked: `address` is
+    /// a flash address in probe-rs's memory map for the chip, which need
+    /// not be anywhere the core can see.
+    pub fn load_binary(
+        &mut self,
+        address: u32,
+        data: &[u8],
+    ) -> Result<(), LoadError> {
+        self.load_with(true, |loader, _| {
+            loader.add_data(address.into(), data)?;
+            Ok(())
+        })
+    }
+
+    fn load_with(
+        &mut self,
+        verify: bool,
+        stage: impl FnOnce(
+            &mut flashing::FlashLoader,
+            &mut probe_rs::Session,
+        ) -> Result<(), LoadError>,
+    ) -> Result<(), LoadError> {
         if !self.can_flash {
             return Err(LoadError::NotAllowed);
         }
@@ -468,14 +503,10 @@ impl ProbeCore {
 
         let mut options = flashing::DownloadOptions::default();
         options.progress = progress;
+        options.verify = verify;
 
         let mut loader = self.session.target().flash_loader();
-        loader.load_image(
-            &mut self.session,
-            &mut std::io::Cursor::new(elf_data),
-            Format::Elf(ElfOptions::default()),
-            None,
-        )?;
+        stage(&mut loader, &mut self.session)?;
         loader.commit(&mut self.session, options)?;
 
         Ok(())

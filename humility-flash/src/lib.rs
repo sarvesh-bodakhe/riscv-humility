@@ -327,6 +327,11 @@ pub enum ProgramImageError {
     #[error("could not read image ELF data from archive")]
     CouldNotReadElfData(#[source] anyhow::Error),
 
+    /// Could not read the boot image using
+    /// [`HubrisArchive::load_boot_image`]
+    #[error("could not read boot image from archive")]
+    CouldNotReadBootImage(#[source] anyhow::Error),
+
     /// Error while programming auxflash
     #[error("failed to program auxflash; your system may not be functional")]
     Auxflash(#[from] ProgramAuxflashError),
@@ -348,10 +353,23 @@ pub fn program_image(
     // error.  (It will hopefully be pretty clear to the user that a
     // half-flashed part is going to be in an ill-defined state!)
     //
-    let elf = hubris
-        .load_flash_elf()
-        .map_err(ProgramImageError::CouldNotReadElfData)?;
-    core.load(&elf).map_err(ProgramImageError::LoadFailed)?;
+    // On a chip whose boot ROM loads a wrapped image from flash, that
+    // image is what goes there, at the address the archive names: the ELF
+    // is linked for wherever the ROM copies it to, which is not flash.
+    //
+    match hubris
+        .load_boot_image()
+        .map_err(ProgramImageError::CouldNotReadBootImage)?
+    {
+        Some((address, image)) => core.load_binary(address, &image),
+        None => {
+            let elf = hubris
+                .load_flash_elf()
+                .map_err(ProgramImageError::CouldNotReadElfData)?;
+            core.load(&elf)
+        }
+    }
+    .map_err(ProgramImageError::LoadFailed)?;
 
     //
     // On Gimlet Rev B, the BOOT0 pin is unstrapped -- and during a flash,
