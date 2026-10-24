@@ -6,6 +6,10 @@ on:
   push:
     branches:
       - master
+      - riscv32-port
+
+permissions:
+  contents: write
 
 jobs:
   nightly-release:
@@ -29,6 +33,13 @@ jobs:
           args: --profile binrelease
 
       - name: Upload Release
-        run: gh release upload --repo oxidecomputer/humility nightly --clobber target/binrelease/humility
+        run: |
+          # A fork starts with no releases; create the one we upload into.
+          gh release view --repo "${REPO}" nightly > /dev/null 2>&1 ||
+              gh release create --repo "${REPO}" nightly --prerelease \
+                  --target "${GITHUB_SHA}" --title nightly \
+                  --notes "Humility built from the latest push."
+          gh release upload --repo "${REPO}" nightly --clobber target/binrelease/humility
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
